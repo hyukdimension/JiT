@@ -101,7 +101,7 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
 
-    # distributed training
+    # distributed training (kept for compatibility but not used in single GPU)
     parser.add_argument('--world_size', default=1, type=int,
                         help='Number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
@@ -112,25 +112,75 @@ def get_args_parser():
     return parser
 
 
+# TINY 이미지넷 시작
+# 추가: Tiny ImageNet용 커스텀 데이터셋 클래스
+import glob
+from PIL import Image
+
+class TinyImageNet(torch.utils.data.Dataset):
+    def __init__(self, root, transform=None):
+        self.samples = []
+        self.targets = []
+        self.transform = transform
+        self.classes = []
+        
+        class_dirs = sorted(glob.glob(os.path.join(root, 'train', '*')))
+        for class_idx, class_dir in enumerate(class_dirs):
+            class_name = os.path.basename(class_dir)
+            self.classes.append(class_name)
+            
+            img_dir = os.path.join(class_dir, 'images')
+            images = glob.glob(os.path.join(img_dir, '*.JPEG'))
+            
+            for img_path in images:
+                self.samples.append(img_path)
+                self.targets.append(class_idx)
+        
+        print(f"Found {len(self.classes)} classes, {len(self.samples)} images")
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img = Image.open(self.samples[idx]).convert('RGB')
+        target = self.targets[idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, target
+# TINY 이미지넷 끝
+
+class CenterCropTransform:
+    def __init__(self, size):
+        self.size = size
+    
+    def __call__(self, img):
+        return center_crop_arr(img, self.size)
+        
 def main(args):
-    misc.init_distributed_mode(args)
+    # MODIFIED: Single GPU - skip distributed initialization
+    args.distributed = False
+    args.world_size = 1
+    args.rank = 0
+    args.gpu = 0
+    
     print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
     print("Arguments:\n{}".format(args).replace(', ', ',\n'))
 
     device = torch.device(args.device)
 
     # Set seeds for reproducibility
-    seed = args.seed + misc.get_rank()
+    seed = args.seed
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     cudnn.benchmark = True
 
-    num_tasks = misc.get_world_size()
-    global_rank = misc.get_rank()
+    # MODIFIED: Single GPU - no distributed setup needed
+    num_tasks = 1
+    global_rank = 0
 
-    # Set up TensorBoard logging (only on main process)
-    if global_rank == 0 and args.output_dir is not None:
+    # Set up TensorBoard logging
+    if args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.output_dir)
     else:
@@ -138,17 +188,19 @@ def main(args):
 
     # Data augmentation transforms
     transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
+        CenterCropTransform(args.img_size),  # Lambda 대신 클래스 사용
         transforms.RandomHorizontalFlip(),
         transforms.PILToTensor()
     ])
 
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    # 새로운 데이터셋 로드
+    dataset_train = TinyImageNet(args.data_path, transform=transform_train)
+
+    #dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
     print(dataset_train)
 
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
+    # MODIFIED: Single GPU - use regular sampler instead of DistributedSampler
+    sampler_train = torch.utils.data.RandomSampler(dataset_train)
     print("Sampler_train =", sampler_train)
 
     data_loader_train = torch.utils.data.DataLoader(
@@ -159,8 +211,9 @@ def main(args):
         drop_last=True
     )
 
-    torch._dynamo.config.cache_size_limit = 128
-    torch._dynamo.config.optimize_ddp = False
+    # Windows에서 Triton 안 돼 아래 주석처리함
+    #torch._dynamo.config.cache_size_limit = 128
+    #torch._dynamo.config.optimize_ddp = False
 
     # Create denoiser
     model = Denoiser(args)
@@ -171,7 +224,8 @@ def main(args):
 
     model.to(device)
 
-    eff_batch_size = args.batch_size * misc.get_world_size()
+    # MODIFIED: Single GPU - world_size is 1
+    eff_batch_size = args.batch_size * 1
     if args.lr is None:  # only base_lr (blr) is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -179,8 +233,8 @@ def main(args):
     print("Actual lr: {:.2e}".format(args.lr))
     print("Effective batch size: %d" % eff_batch_size)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    model_without_ddp = model.module
+    # MODIFIED: Single GPU - no DDP wrapper needed
+    model_without_ddp = model
 
     # Set up optimizer with weight decay adjustment for bias and norm layers
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
@@ -222,9 +276,8 @@ def main(args):
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-
+        # MODIFIED: Single GPU - no sampler.set_epoch() needed for RandomSampler
+        
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 
         # Save checkpoint periodically
@@ -252,7 +305,8 @@ def main(args):
                 evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
             torch.cuda.empty_cache()
 
-        if misc.is_main_process() and log_writer is not None:
+        # MODIFIED: Single GPU - always main process, simplified check
+        if log_writer is not None:
             log_writer.flush()
 
     total_time = time.time() - start_time
@@ -261,6 +315,10 @@ def main(args):
 
 
 if __name__ == '__main__':
+    # 이 부분을 맨 위에 추가
+    import multiprocessing
+    multiprocessing.freeze_support()
+    
     args = get_args_parser().parse_args()
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

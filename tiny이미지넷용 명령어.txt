@@ -1,0 +1,8 @@
+python main_jit.py ^
+--model JiT-B/16 ^
+--batch_size 16 ^
+--gen_bsz 16 ^
+--output_dir ./output ^
+--data_path d:/Download/tiny-imagenet-200 ^
+--class_num 200 ^
+--epochs 10
