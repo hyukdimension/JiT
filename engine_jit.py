@@ -26,11 +26,20 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+
+
+
+        p_model = next(model.parameters())
+        p_optim = optimizer.param_groups[0]['params'][0]
+        print(f"Is same object?: {p_model is p_optim}") # 이게 False면 백날 돌려도 안 변합니다.
+
+
+
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         # normalize image to [-1, 1]
-        x = x.to(device, non_blocking=True).to(torch.float32).div_(255) # todo 반드시 float32로 바꿔야 함 (반드시!)
+        x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
         x = x * 2.0 - 1.0
         labels = labels.to(device, non_blocking=True)
 
@@ -44,11 +53,85 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         optimizer.zero_grad()
         loss.backward()
+
+        # loss.backward() 바로 다음 줄
+        print("\n" + "="*50)
+        print("GRADIENT FLOW AUDIT")
+        print("="*50)
+
+        has_grad_count = 0
+        no_grad_count = 0
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                if param.grad is not None:
+                    grad_abs_mean = param.grad.abs().mean().item()
+                    if grad_abs_mean > 0:
+                        print(f"[OK] {name:<40} | Grad: {grad_abs_mean:.10f}")
+                        has_grad_count += 1
+                    else:
+                        print(f"[ZERO] {name:<40} | Grad is EXACTLY 0.0000")
+                        no_grad_count += 1
+                else:
+                    print(f"[!! NONE !!] {name:<40} | No Gradient at all")
+                    no_grad_count += 1
+            else:
+                print(f"[FROZEN] {name:<40} | requires_grad=False")
+
+        print("="*50)
+        print(f"Summary: Flowing: {has_grad_count} | Broken/Zero: {no_grad_count}")
+        print("="*50 + "\n")
+
+
+        # loss.backward() 바로 다음 줄
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                print(f"Found Gradient in {name}! Mean: {param.grad.abs().mean().item()}")
+                break
+        else:
+            print("STILL NONE: No parameters received gradients.")
+
+        print(f"Does loss have grad_fn?: {loss.grad_fn}")
+
+        # 모니터링 블록 내부
+        first_param = next(model_without_ddp.net.parameters())
+        if first_param.grad is not None:
+            print(f"[Grad Check] Grad Abs Mean: {first_param.grad.abs().mean().item():.10f}")
+        else:
+            print("[Grad Check] Gradient is NONE!")
+
         optimizer.step()
+
+
+        param = next(model.parameters())
+        # 1. 가중치에 강제로 1.0을 더해버립니다 (무조건 변해야 함)
+        param.add_(1.0) 
+        print(f"!!! FORCED UPDATE TEST !!! Mean: {param.mean().item():.6f}")
+
+
+
+        # 1. 모니터링 연산 (데이터 오염 및 스케일 확인)
+        if data_iter_step % 100 == 0:
+            with torch.no_grad():
+                # 1. 특정 레이어(예: 첫 번째 컨볼루션)의 가중치 분포 확인
+                # 'net'은 Denoiser 내부의 JiT 모델입니다. 
+                # 레이어 이름은 모델 구조에 따라 다를 수 있으니 확인이 필요합니다.
+                first_layer_w = next(model_without_ddp.net.parameters())
+                
+                w_max = first_layer_w.max().item()
+                w_min = first_layer_w.min().item()
+                w_std = first_layer_w.std().item()
+
+                print(f"\n[Weight Check] Max: {w_max:.6f}, Min: {w_min:.6f}, Std: {w_std:.6f}")
+                
+                # 2. Gradient가 흐르고 있는지 확인 (학습 직후에만 유효)
+                if first_layer_w.grad is not None:
+                    g_std = first_layer_w.grad.std().item()
+                    print(f"[Grad Check] Gradient Std: {g_std:.8f}")
 
         torch.cuda.synchronize()
 
-        model_without_ddp.update_ema()
+        #model_without_ddp.update_ema()
 
         metric_logger.update(loss=loss_value)
         lr = optimizer.param_groups[0]["lr"]
@@ -116,14 +199,31 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         sampled_images = sampled_images.detach().cpu()
 
         # distributed save images
+        # engine_jit.py 내 evaluate 함수 수정
+        # ...
         for b_id in range(sampled_images.size(0)):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-            #if img_id >= args.num_images:
-            #    break
-            gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
-            gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            print(f"G model Raw Tensor - Min: {gen_img.min():.4f}, Max: {gen_img.max():.4f}, Mean: {gen_img.mean():.4f}")
-            cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
+            
+            # [1, H, W] -> [H, W] 로 변환 (squeeze 사용)
+            img_tensor = sampled_images[b_id].numpy().squeeze()
+
+
+
+
+            # B 모델 전용: [-1, 1] -> [0, 255] 복원 로직
+            img_rescaled = (img_tensor + 1.0) / 2.0
+            # (img_tensor + 1.0) / 2.0  =>  [-1, 1]을 [0, 1]로 변환
+            # 그 후 * 255 수행
+            gen_img = np.round(np.clip(img_rescaled * 255, 0, 255)).astype(np.uint8)
+
+
+
+            
+            # 이제 G 모델과 동일한 스케일(0~255)에서 로그를 출력합니다.
+            print(f"B model Final Image - Min: {gen_img.min():.4f}, Max: {gen_img.max():.4f}, Mean: {gen_img.mean():.4f}")
+            
+            # 이미지 저장
+            cv2.imwrite(os.path.join(save_folder, f'{img_id:05d}.png'), gen_img)
 
     torch.distributed.barrier()
 

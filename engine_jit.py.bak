@@ -56,9 +56,6 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
-		print("log writer")
-		print(log_writer)
-		exit()
         if log_writer is not None:
             # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
@@ -119,13 +116,17 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         sampled_images = sampled_images.detach().cpu()
 
         # distributed save images
+        # engine_jit.py 내 evaluate 함수 수정
+        # ...
         for b_id in range(sampled_images.size(0)):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-            #if img_id >= args.num_images:
-            #    break
-            gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
-            gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
+            
+            # [1, H, W] -> [H, W] 로 변환 (squeeze 사용)
+            img_tensor = sampled_images[b_id].numpy().squeeze() 
+            gen_img = np.round(np.clip(img_tensor * 255, 0, 255)).astype(np.uint8)
+            
+            # 1채널일 경우 cv2.imwrite는 자동으로 Grayscale로 저장합니다.
+            cv2.imwrite(os.path.join(save_folder, f'{img_id:05d}.png'), gen_img)
 
     torch.distributed.barrier()
 

@@ -1,1 +1,1 @@
-python main_jit.py train.json
+python main_jit.py --config train.json

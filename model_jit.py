@@ -14,7 +14,7 @@ def modulate(x, shift, scale):
 class BottleneckPatchEmbed(nn.Module):
     """ Image to Patch Embedding
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
+    def __init__(self, img_size=224, patch_size=16, in_chans=1, pca_dim=768, embed_dim=768, bias=True):
         super().__init__()
         img_size = (img_size, img_size)
         patch_size = (patch_size, patch_size)
@@ -171,8 +171,8 @@ class FinalLayer(nn.Module):
 
     # @torch.compile 
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
+        # x = modulate(self.norm_final(x), shift, scale) 대신
+        #x = self.norm_final(x) 
         x = self.linear(x)
         return x
 
@@ -192,10 +192,10 @@ class JiTBlock(nn.Module):
         )
 
     # @torch.compile
-    def forward(self, x,  c, feat_rope=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+    def forward(self, x, c, feat_rope=None):
+        # adaLN을 쓰지 않고 일반적인 LayerNorm과 잔차 연결만 사용
+        x = x + self.attn(self.norm1(x), rope=feat_rope)
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -207,7 +207,7 @@ class JiT(nn.Module):
         self,
         input_size=256,
         patch_size=16,
-        in_channels=3,
+        in_channels=1,
         hidden_size=1024,
         depth=24,
         num_heads=16,
@@ -300,16 +300,16 @@ class JiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        #for block in self.blocks:
+        #    nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+        #    nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        #nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        #nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        #nn.init.constant_(self.final_layer.linear.weight, 0)
+        #nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x, p):
         """

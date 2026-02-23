@@ -1,1 +1,1 @@
-python main_jit.py inference.json
+python main_jit.py --config inference.json

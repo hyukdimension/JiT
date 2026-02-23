@@ -13,7 +13,7 @@ import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 
-from util.crop import random_crop_arr, center_crop_arr
+from util.crop import center_crop_arr
 import util.misc as misc
 import torch.distributed as dist
 
@@ -44,9 +44,6 @@ GLOBAL_IMG_SIZE = 256
 def center_crop_transform(img):
     return center_crop_arr(img, GLOBAL_IMG_SIZE)
 
-def random_crop_transform(img):
-    return random_crop_arr(img, GLOBAL_IMG_SIZE)
-
 # --- [2] Single Folder Dataset (TIFF 전용) ---
 class SingleFolderDataset(torch.utils.data.Dataset):
     """단일 폴더에서 TIFF 이미지만 로드하는 데이터셋"""
@@ -74,17 +71,16 @@ class SingleFolderDataset(torch.utils.data.Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        img = Image.open(self.samples[idx]).convert('L')
+        img = Image.open(self.samples[idx]).convert('RGB')
         if self.transform:
             img = self.transform(img)
         # label은 0으로 통일 (unconditional 생성)
         return img, 0
 	
 # --- [3] Argument Parser ---
-# main_jit.py 의 get_args_parser 부분 수정
 def get_args_parser():
-    parser = argparse.ArgumentParser('JiT', add_help=True) # help=False면 인자 설명이 안 나옴
-    parser.add_argument('--config', default='', type=str, help='config file path')
+    parser = argparse.ArgumentParser('JiT', add_help=False)
+    parser.add_argument('--config', default='', type=str)
     
     # architecture
     parser.add_argument('--model', default='JiT-B/16', type=str, metavar='MODEL',
@@ -187,34 +183,31 @@ def main(args):
     else:
         log_writer = None
 
-    # evaluate_gen일 때는 데이터셋 로드 안 함
-    if not args.evaluate_gen:
-        print(f"[*] Loading dataset from: {args.data_path}")
-        transform_train = transforms.Compose([
-            transforms.Lambda(random_crop_transform),
-            transforms.RandomHorizontalFlip(),
-            transforms.PILToTensor() 
-        ])
-        
-        dataset_train = SingleFolderDataset(args.data_path, transform=transform_train)
-        
-        print(f"[*] Dataset size: {len(dataset_train)} images")
-        print(f"[*] Batch size: {args.batch_size}")
-        import math
-        num_batches = math.ceil(len(dataset_train) / args.batch_size)
-        print(f"[*] Number of batches per epoch: {num_batches}")
-        
-        data_loader_train = torch.utils.data.DataLoader(
-            dataset_train, 
-            sampler=torch.utils.data.RandomSampler(dataset_train),
-            batch_size=args.batch_size, 
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem, 
-            drop_last=False
-        )
-    else:
-        print("[*] Inference mode: skipping dataset loading")
-        data_loader_train = None
+    # Data augmentation transforms
+    print(f"[*] Loading dataset from: {args.data_path}")
+    transform_train = transforms.Compose([
+        transforms.Lambda(center_crop_transform),
+        transforms.RandomHorizontalFlip(),
+        transforms.PILToTensor() 
+    ])
+    
+        # SingleFolderDataset 사용
+    dataset_train = SingleFolderDataset(args.data_path, transform=transform_train)
+    
+    print(f"[*] Dataset size: {len(dataset_train)} images")
+    print(f"[*] Batch size: {args.batch_size}")
+    import math
+    num_batches = math.ceil(len(dataset_train) / args.batch_size)
+    print(f"[*] Number of batches per epoch: {num_batches}")
+    
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, 
+        sampler=torch.utils.data.RandomSampler(dataset_train),
+        batch_size=args.batch_size, 
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem, 
+        drop_last=False
+    )
 
     # Create denoiser
     print(f"[*] Creating model: {args.model}")
@@ -223,16 +216,10 @@ def main(args):
 
     # 2. Optimizer 설정
     if args.lr is None:
-        args.lr = 0.0001 # LDY ToDo, args.blr * (args.batch_size * misc.get_world_size()) / 256
+        args.lr = args.blr * (args.batch_size * misc.get_world_size()) / 256
     print(f"[*] Learning rate: {args.lr:.6f}")
-    # LDY ToDo
-    if False:
-        param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
-        optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
-    else:
-        optimizer = torch.optim.AdamW(model_without_ddp.parameters(), lr=args.lr, betas=(0.9, 0.95))
-    
-    
+    param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     print(optimizer)
 
     # 3. EMA 초기화
@@ -240,64 +227,24 @@ def main(args):
     model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
     model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
 
-    # 248번 라인 근처: Resume 부분 (이곳을 아래 코드로 덮어쓰세요)
+    # Resume from checkpoint if provided
     if args.resume:
         checkpoint_path = args.resume
         if os.path.isdir(args.resume):
             checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth")
-            
         if os.path.exists(checkpoint_path):
             print(f"[*] Loading checkpoint: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-            # --- [최종 보정 로직: 모든 Size Mismatch 대응] ---
-            state_dict = checkpoint.get('model', checkpoint.get('model_base'))
-            model_dict = model_without_ddp.state_dict()
-            new_state_dict = {}
-
-            for k, v in state_dict.items():
-                if k in model_dict:
-                    # 1. 입력 레이어 채널 보정 (3ch -> 1ch)
-                    if k == 'net.x_embedder.proj1.weight' and v.shape[1] == 3 and model_dict[k].shape[1] == 1:
-                        print(f"[*] Converting {k} (3ch -> 1ch)")
-                        v = v.mean(dim=1, keepdim=True)
-                    
-                    # 2. 클래스 임베딩 크기 보정 (1001 -> 현재 class_num)
-                    elif k == 'net.y_embedder.embedding_table.weight' and v.shape != model_dict[k].shape:
-                        print(f"[*] Resizing {k}: {v.shape} -> {model_dict[k].shape}")
-                        # 현재 필요한 개수만큼만 잘라서 사용
-                        v = v[:model_dict[k].shape[0], :]
-
-                    # 3. 출력 레이어 및 기타 사이즈 불일치 (Pos_embed 등)
-                    if v.shape != model_dict[k].shape:
-                        # 3채널 평균 보정이 필요한 경우 (final_layer)
-                        if v.shape[0] == model_dict[k].shape[0] * 3:
-                            print(f"[*] Converting {k} (3ch output -> 1ch output)")
-                            if len(v.shape) == 2: # Weight
-                                v = v.view(3, -1, v.shape[-1]).mean(dim=0)
-                            else: # Bias
-                                v = v.view(3, -1).mean(dim=0)
-                        else:
-                            print(f"[!] Skipping {k} due to shape mismatch: {v.shape} vs {model_dict[k].shape}")
-                            continue # 크기가 도저히 안 맞으면 로드하지 않고 넘어감 (기존 모델 초기값 유지)
-                    
-                    new_state_dict[k] = v
-
-            # strict=False를 주어 누락된 키가 있어도 실행되게 함
-            model_without_ddp.load_state_dict(new_state_dict, strict=False)
-            print("[*] Load complete with partial weight matching.")
+            model_without_ddp.load_state_dict(checkpoint.get('model', checkpoint.get('model_base')))
             
-            # EMA 파라미터가 있다면 동일하게 보정하거나, 일단 무시하고 진행
             if 'model_ema1' in checkpoint and 'model_ema2' in checkpoint:
-                # EMA도 동일한 보정이 필요하지만, 일단 생략 시 오류가 날 수 있으므로 주의
-                pass 
-
-            if 'optimizer' in checkpoint:
-                try:
-                    optimizer.load_state_dict(checkpoint['optimizer'])
-                    args.start_epoch = checkpoint.get('epoch', -1) + 1
-                except:
-                    print("[!] Optimizer mismatch, skipped.")
+                e1, e2 = checkpoint['model_ema1'], checkpoint['model_ema2']
+                model_without_ddp.ema_params1 = [e1[n].to(device) for n, _ in model_without_ddp.named_parameters()]
+                model_without_ddp.ema_params2 = [e2[n].to(device) for n, _ in model_without_ddp.named_parameters()]
             
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                args.start_epoch = checkpoint.get('epoch', -1) + 1
             del checkpoint
             torch.cuda.empty_cache()
             print(f"[*] Resumed from epoch {args.start_epoch}")
@@ -324,13 +271,13 @@ def main(args):
         
         
         
-        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer, args=args)
         
         # 저장 로직
         if (epoch + 1) % args.save_last_freq == 0 or (epoch + 1) == args.epochs:
             misc.save_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, epoch=epoch, epoch_name="last")
         if (epoch + 1) % 100 == 0:
-            misc.save_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, epoch=epoch, epoch_name=str(epoch + 1))
+            misc.save_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, epoch=epoch, epoch_name=None)
 
         # Perform online evaluation at specified intervals
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
