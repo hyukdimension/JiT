@@ -1,0 +1,14 @@
+{
+    "model": "JiT-B/16",
+    "img_size": 256,
+    "gen_bsz": 1,
+    "num_images": 1000,
+    "cfg": 3.0,
+    "output_dir": "d:/output/jit/output_v02",
+    "resume": "D:/Download/jit/jit-b-16/checkpoint-last.pth",
+    "evaluate_gen": true,
+    "device": "cuda",
+    "class_num": 1000,
+    "sampling_method": "heun",
+    "num_sampling_steps": 50
+}

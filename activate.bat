@@ -1,0 +1,1 @@
+D:\env\py_3.13\Scripts\activate

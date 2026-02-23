@@ -1,0 +1,24 @@
+{
+    "model": "JiT-B/16",
+    "img_size": 256,
+    "batch_size": 128,
+    "epochs": 200,
+    "blr": 5e-5,
+    "warmup_epochs": 5,
+    "weight_decay": 0.0,
+    "ema_decay1": 0.9999,
+    "ema_decay2": 0.9996,
+    "P_mean": -0.8,
+    "P_std": 0.8,
+    "noise_scale": 1.0,
+    "t_eps": 0.05,
+    "label_drop_prob": 0.1,
+    "class_num": 1000,
+    "output_dir": "d:/output/jit/output_v03",
+    "data_path": "d:/data/original/noise25",
+    "num_workers": 4,
+    "device": "cuda",
+    "save_last_freq": 5, <-- 
+    "log_freq": 100, <-- todo: 다 저장 (-->1)
+    "seed": 0
+}

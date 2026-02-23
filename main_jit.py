@@ -3,26 +3,85 @@ import datetime
 import numpy as np
 import os
 import time
+import json
+import copy
 from pathlib import Path
+from PIL import Image
 
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 
 from util.crop import center_crop_arr
 import util.misc as misc
+import torch.distributed as dist
 
-import copy
 from engine_jit import train_one_epoch, evaluate
-
 from denoiser import Denoiser
 
+# --- [1] 윈도우 멀티프로세싱 호환 설정 (Pickle 에러 방지) ---
+def _is_initialized(): return True
+def _get_rank(): return 0
+def _get_world_size(): return 1
+def _barrier(): return None
+def _all_reduce(x, **kwargs): return x
+def _get_backend(): return 'gloo'
 
+def setup_runtime_env():
+    if not dist.is_initialized():
+        dist.is_initialized = _is_initialized
+        dist.get_rank = _get_rank
+        dist.get_world_size = _get_world_size
+        dist.barrier = _barrier
+        dist.all_reduce = _all_reduce
+        dist.get_backend = _get_backend
+    misc.get_rank = _get_rank
+    misc.get_world_size = _get_world_size
+    misc.is_main_process = _is_initialized
+
+GLOBAL_IMG_SIZE = 256
+def center_crop_transform(img):
+    return center_crop_arr(img, GLOBAL_IMG_SIZE)
+
+# --- [2] Single Folder Dataset (TIFF 전용) ---
+class SingleFolderDataset(torch.utils.data.Dataset):
+    """단일 폴더에서 TIFF 이미지만 로드하는 데이터셋"""
+    def __init__(self, root, transform=None):
+        self.samples = []
+        self.transform = transform
+        
+        abs_root = os.path.abspath(root)
+        if not os.path.exists(abs_root):
+            raise ValueError(f"[Error] Directory does not exist: {abs_root}")
+        
+        valid_exts = {'.tif', '.tiff'}
+        
+        # 단일 폴더에서 TIFF 이미지만 수집
+        for f in sorted(os.listdir(abs_root)):
+            if os.path.splitext(f)[1].lower() in valid_exts:
+                self.samples.append(os.path.join(abs_root, f))
+        
+        if len(self.samples) == 0:
+            raise ValueError(f"[Error] No TIFF images found in {abs_root}")
+        
+        print(f"[*] Loaded {len(self.samples)} TIFF images from {abs_root}")
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        img = Image.open(self.samples[idx]).convert('RGB')
+        if self.transform:
+            img = self.transform(img)
+        # label은 0으로 통일 (unconditional 생성)
+        return img, 0
+	
+# --- [3] Argument Parser ---
 def get_args_parser():
     parser = argparse.ArgumentParser('JiT', add_help=False)
-
+    parser.add_argument('--config', default='', type=str)
+    
     # architecture
     parser.add_argument('--model', default='JiT-B/16', type=str, metavar='MODEL',
                         help='Name of the model to train')
@@ -30,7 +89,7 @@ def get_args_parser():
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
 
-    # training
+    # Training Hyperparameters
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
                         help='Epochs to warm up LR')
@@ -55,14 +114,13 @@ def get_args_parser():
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
-
+	
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='Starting epoch')
-    parser.add_argument('--num_workers', default=12, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--pin_mem', action='store_true',
-                        help='Pin CPU memory in DataLoader for faster GPU transfers')
-    parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
+        help='Pin CPU memory in DataLoader for faster GPU transfers')
     parser.set_defaults(pin_mem=True)
 
     # sampling
@@ -88,7 +146,7 @@ def get_args_parser():
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='Path to the dataset')
-    parser.add_argument('--class_num', default=1000, type=int)
+    parser.add_argument('--class_num', default=1, type=int)  # 200 → 1로 변경
 
     # checkpointing
     parser.add_argument('--output_dir', default='./output_dir',
@@ -100,203 +158,131 @@ def get_args_parser():
     parser.add_argument('--log_freq', default=100, type=int)
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
-
-    # distributed training (kept for compatibility but not used in single GPU)
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='Number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument('--dist_url', default='env://',
-                        help='URL used to set up distributed training')
 
     return parser
 
 
-# TINY 이미지넷 시작
-# 추가: Tiny ImageNet용 커스텀 데이터셋 클래스
-import glob
-from PIL import Image
-
-class TinyImageNet(torch.utils.data.Dataset):
-    def __init__(self, root, transform=None):
-        self.samples = []
-        self.targets = []
-        self.transform = transform
-        self.classes = []
-        
-        class_dirs = sorted(glob.glob(os.path.join(root, 'train', '*')))
-        for class_idx, class_dir in enumerate(class_dirs):
-            class_name = os.path.basename(class_dir)
-            self.classes.append(class_name)
-            
-            img_dir = os.path.join(class_dir, 'images')
-            images = glob.glob(os.path.join(img_dir, '*.JPEG'))
-            
-            for img_path in images:
-                self.samples.append(img_path)
-                self.targets.append(class_idx)
-        
-        print(f"Found {len(self.classes)} classes, {len(self.samples)} images")
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        img = Image.open(self.samples[idx]).convert('RGB')
-        target = self.targets[idx]
-        if self.transform:
-            img = self.transform(img)
-        return img, target
-# TINY 이미지넷 끝
-
-class CenterCropTransform:
-    def __init__(self, size):
-        self.size = size
-    
-    def __call__(self, img):
-        return center_crop_arr(img, self.size)
-        
 def main(args):
-    # MODIFIED: Single GPU - skip distributed initialization
-    args.distributed = False
-    args.world_size = 1
-    args.rank = 0
-    args.gpu = 0
-    
-    print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
-    print("Arguments:\n{}".format(args).replace(', ', ',\n'))
+    setup_runtime_env()
+    global GLOBAL_IMG_SIZE
+    GLOBAL_IMG_SIZE = args.img_size
 
     device = torch.device(args.device)
-
-    # Set seeds for reproducibility
-    seed = args.seed
+    seed = args.seed + misc.get_rank() # <-- todo: 1) 재현성 최우선 고려. 2) 바꿔서 넣어보기
     torch.manual_seed(seed)
     np.random.seed(seed)
+    cudnn.benchmark = True # <-- todo: 의미 알기. deterministic 관련. 조합 고려 (씨드 관련)
 
-    cudnn.benchmark = True
+    global_rank = misc.get_rank()
 
-    # MODIFIED: Single GPU - no distributed setup needed
-    num_tasks = 1
-    global_rank = 0
-
-    # Set up TensorBoard logging
-    if args.output_dir is not None:
+    # Set up TensorBoard logging (only on main process)
+    if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.output_dir)
     else:
         log_writer = None
 
-    # Data augmentation transforms
-    transform_train = transforms.Compose([
-        CenterCropTransform(args.img_size),  # Lambda 대신 클래스 사용
-        transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor()
-    ])
-
-    # 새로운 데이터셋 로드
-    dataset_train = TinyImageNet(args.data_path, transform=transform_train)
-
-    #dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
-
-    # MODIFIED: Single GPU - use regular sampler instead of DistributedSampler
-    sampler_train = torch.utils.data.RandomSampler(dataset_train)
-    print("Sampler_train =", sampler_train)
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train, sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True
-    )
-
-    # Windows에서 Triton 안 돼 아래 주석처리함
-    #torch._dynamo.config.cache_size_limit = 128
-    #torch._dynamo.config.optimize_ddp = False
+    # evaluate_gen일 때는 데이터셋 로드 안 함
+    print("args.evaluate_gen")
+    print(args.evaluate_gen)
+    if not args.evaluate_gen:
+        print(f"[*] Loading dataset from: {args.data_path}")
+        transform_train = transforms.Compose([
+            transforms.Lambda(center_crop_transform),
+            transforms.RandomHorizontalFlip(),
+            transforms.PILToTensor() 
+        ])
+        
+        dataset_train = SingleFolderDataset(args.data_path, transform=transform_train)
+        
+        print(f"[*] Dataset size: {len(dataset_train)} images")
+        print(f"[*] Batch size: {args.batch_size}")
+        import math
+        num_batches = math.ceil(len(dataset_train) / args.batch_size)
+        print(f"[*] Number of batches per epoch: {num_batches}")
+        
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train, 
+            sampler=torch.utils.data.RandomSampler(dataset_train),
+            batch_size=args.batch_size, 
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem, 
+            drop_last=False
+        )
+    else:
+        print("[*] Inference mode: skipping dataset loading")
+        data_loader_train = None
 
     # Create denoiser
-    model = Denoiser(args)
-
-    print("Model =", model)
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print("Number of trainable parameters: {:.6f}M".format(n_params / 1e6))
-
-    model.to(device)
-
-    # MODIFIED: Single GPU - world_size is 1
-    eff_batch_size = args.batch_size * 1
-    if args.lr is None:  # only base_lr (blr) is specified
-        args.lr = args.blr * eff_batch_size / 256
-
-    print("Base lr: {:.2e}".format(args.lr * 256 / eff_batch_size))
-    print("Actual lr: {:.2e}".format(args.lr))
-    print("Effective batch size: %d" % eff_batch_size)
-
-    # MODIFIED: Single GPU - no DDP wrapper needed
+    print(f"[*] Creating model: {args.model}")
+    model = Denoiser(args).to(device)
     model_without_ddp = model
 
-    # Set up optimizer with weight decay adjustment for bias and norm layers
+    # 2. Optimizer 설정
+    if args.lr is None:
+        args.lr = args.blr * (args.batch_size * misc.get_world_size()) / 256
+    print(f"[*] Learning rate: {args.lr:.6f}")
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95)) # <-- 베타 의미.
     print(optimizer)
 
+    # 3. EMA 초기화
+    print("[*] Initializing EMA parameters")
+    model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
+    model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
+
     # Resume from checkpoint if provided
-    checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth") if args.resume else None
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        model_without_ddp.load_state_dict(checkpoint['model'])
+    if args.resume: 
+        checkpoint_path = args.resume
+        if os.path.isdir(args.resume):
+            checkpoint_path = os.path.join(args.resume, "checkpoint-last.pth")
+        if os.path.exists(checkpoint_path):
+            print(f"[*] Loading checkpoint: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+            model_without_ddp.load_state_dict(checkpoint.get('model', checkpoint.get('model_base')))
+            
+            if 'model_ema1' in checkpoint and 'model_ema2' in checkpoint:
+                e1, e2 = checkpoint['model_ema1'], checkpoint['model_ema2']
+                model_without_ddp.ema_params1 = [e1[n].to(device) for n, _ in model_without_ddp.named_parameters()]
+                model_without_ddp.ema_params2 = [e2[n].to(device) for n, _ in model_without_ddp.named_parameters()]
+            
+            if 'optimizer' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                args.start_epoch = checkpoint.get('epoch', -1) + 1
+            del checkpoint
+            torch.cuda.empty_cache()
+            print(f"[*] Resumed from epoch {args.start_epoch}")
 
-        ema_state_dict1 = checkpoint['model_ema1']
-        ema_state_dict2 = checkpoint['model_ema2']
-        model_without_ddp.ema_params1 = [ema_state_dict1[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        model_without_ddp.ema_params2 = [ema_state_dict2[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        print("Resumed checkpoint from", args.resume)
-
-        if 'optimizer' in checkpoint and 'epoch' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            args.start_epoch = checkpoint['epoch'] + 1
-            print("Loaded optimizer & scaler state!")
-        del checkpoint
-    else:
-        model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
-        model_without_ddp.ema_params2 = copy.deepcopy(list(model_without_ddp.parameters()))
-        print("Training from scratch")
-
-    # Evaluate generation
     if args.evaluate_gen:
-        print("Evaluating checkpoint at {} epoch".format(args.start_epoch))
-        with torch.random.fork_rng():
-            torch.manual_seed(seed)
-            with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+        evaluate(model_without_ddp, args, args.start_epoch, batch_size=args.gen_bsz, log_writer=log_writer)
         return
+	
+    
 
+    # 6. 학습 시작
+    print(f"\n{'='*60}")
+    print(f"[*] Training started: Epoch {args.start_epoch} to {args.epochs}")
+    print(f"    - Model: {args.model}")
+    print(f"    - Image size: {args.img_size}x{args.img_size}")
+    print(f"    - Class num: {args.class_num}")
+    print(f"    - Device: {device}")
+    print(f"{'='*60}\n")
+    
     # Training loop
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
-        # MODIFIED: Single GPU - no sampler.set_epoch() needed for RandomSampler
+        
+        
         
         train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
-
-        # Save checkpoint periodically
-        if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
-            misc.save_model(
-                args=args,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                epoch=epoch,
-                epoch_name="last"
-            )
-
-        if epoch % 100 == 0 and epoch > 0:
-            misc.save_model(
-                args=args,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                epoch=epoch
-            )
+        
+        # 저장 로직
+        if (epoch + 1) % args.save_last_freq == 0 or (epoch + 1) == args.epochs:
+            misc.save_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, epoch=epoch, epoch_name="last")
+        if (epoch + 1) % 100 == 0:
+            misc.save_model(args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, epoch=epoch, epoch_name=None)
 
         # Perform online evaluation at specified intervals
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
@@ -305,20 +291,26 @@ def main(args):
                 evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
             torch.cuda.empty_cache()
 
-        # MODIFIED: Single GPU - always main process, simplified check
-        if log_writer is not None:
+        if misc.is_main_process() and log_writer is not None:
             log_writer.flush()
-
+            
     total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print('Training time:', total_time_str)
-
+    print(f"\n{'='*60}")
+    print(f"[*] Training finished!")
+    print(f"    - Total time: {str(datetime.timedelta(seconds=int(total_time)))}")
+    print(f"{'='*60}\n")
 
 if __name__ == '__main__':
-    # 이 부분을 맨 위에 추가
-    import multiprocessing
-    multiprocessing.freeze_support()
+    parser = get_args_parser()
+    args = parser.parse_args()
     
-    args = get_args_parser().parse_args()
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            config_dict = json.load(f)
+            for k, v in config_dict.items():
+                if hasattr(args, k):
+                    val = float(v) if k in ['lr', 'blr', 'weight_decay', 'interval_min', 'interval_max'] and isinstance(v, str) else v
+                    setattr(args, k, val)
+    
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)

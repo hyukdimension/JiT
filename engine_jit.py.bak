@@ -30,7 +30,7 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         # normalize image to [-1, 1]
-        x = x.to(device, non_blocking=True).to(torch.float32).div_(255) # todo 반드시 float32로 바꿔야 함 (반드시!)
+        x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
         x = x * 2.0 - 1.0
         labels = labels.to(device, non_blocking=True)
 
@@ -56,6 +56,9 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
+		print("log writer")
+		print(log_writer)
+		exit()
         if log_writer is not None:
             # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
@@ -122,7 +125,6 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
             #    break
             gen_img = np.round(np.clip(sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            print(f"G model Raw Tensor - Min: {gen_img.min():.4f}, Max: {gen_img.max():.4f}, Mean: {gen_img.mean():.4f}")
             cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
 
     torch.distributed.barrier()

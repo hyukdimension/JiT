@@ -1,0 +1,1 @@
+python main_jit.py train.json
