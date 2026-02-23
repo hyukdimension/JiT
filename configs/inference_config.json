@@ -1,0 +1,18 @@
+{
+    "CONFIG_TYPE": "inference",
+    "CONFIG_VERSION": "1.0",
+    "COMMON_CONFIG": "configs/common_config.json",
+
+    "# --- 자주 바꾸는 값 ---": "",
+    "cfg": 1.0,
+    "num_images": 1,
+    "gen_bsz": 10,
+    "interval_min": 0.1,
+    "interval_max": 1.0,
+
+    "# --- 체크포인트 ---": "",
+    "checkpoint": "d:/output/jit/output_v03/checkpoint-100.pth",
+
+    "# --- 출력 ---": "",
+    "output_dir": "d:/output/jit/output_v04"
+}

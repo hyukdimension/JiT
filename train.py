@@ -1,0 +1,153 @@
+import argparse
+import datetime
+import os
+import copy
+import time
+
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+
+from util.config_loader import load_train_config
+import util.misc as misc
+
+from data.dataset import SingleFolderDataset, build_transform
+from diffusion.train_diffusion import DiffusionTrainer
+from diffusion.inference_diffusion import DiffusionSampler
+from runners.train_runner import train_one_epoch, apply_ema_to_sampler
+from runners.inference_runner import run_inference
+
+
+# --- 윈도우 단일 GPU 환경 dist 패치 ---
+def _is_initialized(): return True
+def _get_rank():        return 0
+def _get_world_size():  return 1
+def _barrier():         return None
+def _all_reduce(x, **kwargs): return x
+def _get_backend():     return 'gloo'
+
+def setup_runtime_env():
+    if not dist.is_initialized():
+        dist.is_initialized = _is_initialized
+        dist.get_rank       = _get_rank
+        dist.get_world_size = _get_world_size
+        dist.barrier        = _barrier
+        dist.all_reduce     = _all_reduce
+        dist.get_backend    = _get_backend
+    misc.get_rank        = _get_rank
+    misc.get_world_size  = _get_world_size
+    misc.is_main_process = _is_initialized
+
+
+def main(args):
+    setup_runtime_env()
+
+    device = torch.device(args.device)
+    torch.manual_seed(args.seed + misc.get_rank())
+    np.random.seed(args.seed)
+    cudnn.benchmark = True
+
+    # TensorBoard
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_writer = SummaryWriter(log_dir=args.output_dir) if misc.get_rank() == 0 else None
+
+    # 데이터셋
+    print(f"[*] Loading dataset from: {args.data_path}")
+    dataset_train    = SingleFolderDataset(args.data_path, transform=build_transform(args.img_size))
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train,
+        sampler=torch.utils.data.RandomSampler(dataset_train),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
+    )
+
+    # 모델 생성
+    print(f"[*] Creating DiffusionTrainer: {args.model}")
+    denoiser_trainer = DiffusionTrainer(args).to(device)
+
+    # Optimizer
+    if args.lr is None:
+        args.lr = args.blr * (args.batch_size * misc.get_world_size()) / 256
+    print(f"[*] Learning rate: {args.lr:.6f}")
+    param_groups = misc.add_weight_decay(denoiser_trainer, args.weight_decay)
+    optimizer    = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+
+    # EMA 초기화
+    print("[*] Initializing EMA parameters")
+    denoiser_trainer.ema_params1 = copy.deepcopy(list(denoiser_trainer.parameters()))
+    denoiser_trainer.ema_params2 = copy.deepcopy(list(denoiser_trainer.parameters()))
+
+    # online_eval용 sampler (필요 시)
+    denoiser_sampler = DiffusionSampler(args).to(device) if args.online_eval else None
+
+    # 체크포인트 로드
+    start_epoch = 0
+    if hasattr(args, 'checkpoint') and args.checkpoint and os.path.exists(args.checkpoint):
+        print(f"[*] Loading checkpoint: {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+        denoiser_trainer.load_state_dict(ckpt.get('model', ckpt.get('model_base')))
+        if 'model_ema1' in ckpt and 'model_ema2' in ckpt:
+            e1, e2 = ckpt['model_ema1'], ckpt['model_ema2']
+            denoiser_trainer.ema_params1 = [e1[n].to(device) for n, _ in denoiser_trainer.named_parameters()]
+            denoiser_trainer.ema_params2 = [e2[n].to(device) for n, _ in denoiser_trainer.named_parameters()]
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+            start_epoch = ckpt.get('epoch', -1) + 1
+        del ckpt
+        torch.cuda.empty_cache()
+        print(f"[*] Resumed from epoch {start_epoch}")
+
+    # 학습 시작
+    print(f"\n{'='*60}")
+    print(f"[*] Training: Epoch {start_epoch} → {args.epochs}")
+    print(f"    Model    : {args.model}")
+    print(f"    img_size : {args.img_size}x{args.img_size}")
+    print(f"    Device   : {device}")
+    print(f"{'='*60}\n")
+
+    start_time = time.time()
+    for epoch in range(start_epoch, args.epochs):
+
+        train_one_epoch(
+            denoiser_trainer, data_loader_train,
+            optimizer, device, epoch,
+            log_writer=log_writer, args=args
+        )
+
+        # 체크포인트 저장
+        if (epoch + 1) % args.save_last_freq == 0 or (epoch + 1) == args.epochs:
+            misc.save_model(args=args, model_without_ddp=denoiser_trainer, optimizer=optimizer, epoch=epoch, epoch_name="last")
+        if (epoch + 1) % 100 == 0:
+            misc.save_model(args=args, model_without_ddp=denoiser_trainer, optimizer=optimizer, epoch=epoch, epoch_name=None)
+
+        # online eval
+        if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
+            torch.cuda.empty_cache()
+            apply_ema_to_sampler(denoiser_trainer, denoiser_sampler)
+            with torch.no_grad():
+                run_inference(denoiser_sampler, args, epoch, log_writer=log_writer)
+            torch.cuda.empty_cache()
+
+        if misc.is_main_process() and log_writer is not None:
+            log_writer.flush()
+
+    total_time = time.time() - start_time
+    print(f"\n{'='*60}")
+    print(f"[*] Training finished!")
+    print(f"    Total time: {str(datetime.timedelta(seconds=int(total_time)))}")
+    print(f"{'='*60}\n")
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser('JiT train')
+    parser.add_argument('--common_config', type=str, required=True)
+    parser.add_argument('--train_config',  type=str, required=True)
+    cli = parser.parse_args()
+
+    args = load_train_config(cli.common_config, cli.train_config)
+    os.makedirs(args.output_dir, exist_ok=True)
+    main(args)

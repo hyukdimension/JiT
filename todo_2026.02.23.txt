@@ -1,0 +1,11 @@
+누락 확인 관점
+
+train_config.json의 "lr": null — 현재 null로 되어 있는데, config_loader.py의 REQUIRED_TRAIN_KEYS 검증을 통과하긴 하지만 train.py에서 args.lr is None일 때 blr로 계산하는 로직이 있으니 의도한 대로 동작하는지 확인이 필요합니다.
+
+train_config.json에 "start_epoch" 항목이 없는데, 체크포인트에서 resume 시 자동으로 읽어오니 문제없습니다.
+---
+Git 관점
+.gitignore가 이미 있으니, 새로 생긴 폴더 구조(diffusion/, runners/, data/, configs/)가 제대로 추적되는지 확인하시면 됩니다.
+---
+선택적으로 할 것
+diffusion/, data/, runners/에 __init__.py가 없는데, 현재는 동작하지만 나중에 패키지로 배포하거나 다른 프로젝트에서 import할 때를 위해 빈 __init__.py를 각 폴더에 추가해두면 깔끔합니다.
