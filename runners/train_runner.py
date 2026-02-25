@@ -1,6 +1,8 @@
 import math
+import os
 import sys
 import copy
+import csv
 
 import torch
 import numpy as np
@@ -33,6 +35,18 @@ def apply_ema_to_sampler(denoiser_trainer, denoiser_sampler):
     denoiser_sampler.load_state_dict(ema_state)
 
 
+def append_loss_csv(csv_path, step, epoch, loss, lr):
+    # train.py에서 이미 파일을 만들었으므로 여기서는 'a' (append)만 함
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['step', 'epoch', 'loss', 'lr'])
+        writer.writerow({
+            'step': step,
+            'epoch': epoch,
+            'loss': f"{loss:.6f}",
+            'lr': f"{lr:.8e}" # lr은 매우 작으므로 과학적 표기법 권장
+        })
+
+
 def train_one_epoch(
     denoiser_trainer,
     data_loader,
@@ -51,12 +65,10 @@ def train_one_epoch(
 
     optimizer.zero_grad()
 
-    if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
-
     for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # iteration 단위 lr 스케줄
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+        global_step = epoch * len(data_loader) + data_iter_step
 
         x      = normalize(x.to(device, non_blocking=True))
         labels = labels.to(device, non_blocking=True)
@@ -83,7 +95,15 @@ def train_one_epoch(
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
         if log_writer is not None:
-            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
-            if data_iter_step % args.log_freq == 0:
-                log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('lr', lr, epoch_1000x)
+                    if data_iter_step % args.log_freq == 0:
+                        # Tensorboard 기록
+                        log_writer.add_scalar('train_loss', loss_value_reduce, global_step)
+                        
+                        # CSV 기록
+                        append_loss_csv(
+                            os.path.join(args.output_dir, 'train_log.csv'),
+                            step=global_step,
+                            epoch=epoch,
+                            loss=loss_value_reduce,
+                            lr=lr
+                        )

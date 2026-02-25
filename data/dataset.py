@@ -10,9 +10,12 @@ def build_transform(img_size: int) -> transforms.Compose:
     """학습용 transform — center crop + random horizontal flip + tensor 변환"""
     return transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, img_size)),
-        transforms.RandomHorizontalFlip(),
         transforms.PILToTensor(),
     ])
+
+        #transforms.Lambda(lambda img: center_crop_arr(img, img_size)),
+        #transforms.RandomHorizontalFlip(),
+        #transforms.PILToTensor(),
 
 
 class SingleFolderDataset(Dataset):
@@ -20,7 +23,7 @@ class SingleFolderDataset(Dataset):
 
     VALID_EXTS = {'.tif', '.tiff'}
 
-    def __init__(self, root: str, transform=None):
+    def __init__(self, root: str, img_size: int, transform=None):
         self.transform = transform
 
         abs_root = os.path.abspath(root)
@@ -35,6 +38,14 @@ class SingleFolderDataset(Dataset):
 
         if len(self.samples) == 0:
             raise ValueError(f"[Dataset Error] TIFF 이미지가 없습니다: {abs_root}")
+
+        # 이미지 크기 검증 — 모든 이미지가 img_size 이상이어야 함
+        for path in self.samples:
+            w, h = Image.open(path).size
+            if h < img_size or w < img_size:
+                raise ValueError(
+                    f"[Dataset Error] 이미지 크기({w}x{h})가 img_size({img_size})보다 작습니다: {path}"
+                )
 
         print(f"[Dataset] {len(self.samples)}개 TIFF 이미지 로드 완료: {abs_root}")
 

@@ -3,23 +3,23 @@
     "CONFIG_VERSION": "1.0",
     "COMMON_CONFIG": "configs/common_config.json",
 
-    "# --- 자주 바꾸는 값 ---": "",
+    "# --- Frequntly Changing Values ---": "",
     "batch_size": 23,
-    "epochs": 10,
+    "epochs": 2,
     "blr": 5e-5,
-    "output_dir": "d:/output/jit/output_v04",
+    "train_output_dir": "d:/output/jit/output_v06",
     "data_path": "d:/data/original/noise25",
 
-    "# --- LR 스케줄 ---": "",
+    "# --- LR Schedule ---": "",
     "lr": null,
     "min_lr": 0.0,
     "lr_schedule": "constant",
     "warmup_epochs": 5,
 
-    "# --- 정규화 ---": "",
+    "# --- Regularization ---": "",
     "weight_decay": 0.0,
 
-    "# --- Diffusion 학습 전용 ---": "",
+    "# --- For Diffusion training ---": "",
     "P_mean": -0.8,
     "P_std": 0.8,
     "label_drop_prob": 0.1,
@@ -28,17 +28,29 @@
     "ema_decay1": 0.9999,
     "ema_decay2": 0.9996,
 
-    "# --- 데이터로더 ---": "",
+    "# --- Sampling ---": "",
+    "train_cfg": 3.0,
+    "train_interval_min": 0.0,
+    "train_interval_max": 1.0,
+    
+    "# --- Data Loader ---": "",
     "num_workers": 0,
     "pin_mem": true,
 
-    "# --- 로깅/저장 ---": "",
+    "# --- Logging/Save ---": "",
     "log_freq": 1,
     "save_last_freq": 5,
     "eval_freq": 40,
     "online_eval": false,
 
-    "# --- 샘플링 (online_eval 시 사용) ---": "",
-    "num_images": 50000,
-    "gen_bsz": 256
+    "# --- Sampling (Common) ---": "",
+    "sampling_method": "",
+    "num_sampling_steps": -1,
+
+    "# --- Sampling (when online-eval is used.) ---": "",
+    "eval_num_images": 50000,
+    "eval_gen_bsz": 256,
+
+    "# --- Reproducability ---": "",
+    "train_seed": 0
 }

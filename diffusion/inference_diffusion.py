@@ -16,9 +16,17 @@ class DiffusionSampler(DiffusionBase):
     # ------------------------------------------------------------------
     @torch.no_grad()
     def sample(self, labels: torch.Tensor) -> torch.Tensor:
+
         """이미지 생성 메인 메서드"""
         device = labels.device
         bsz    = labels.size(0)
+
+
+        
+        z = self.noise_scale * torch.randn(bsz, self.in_channels, self.img_size, self.img_size, device=device)
+        print("z 초기값:", z[0, 0, 0, :5])
+
+        
 
         z = self.noise_scale * torch.randn(
             bsz, self.in_channels, self.img_size, self.img_size, device=device

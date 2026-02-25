@@ -3,8 +3,6 @@ import datetime
 import os
 import copy
 import time
-import math
-import json
 
 import numpy as np
 import torch
@@ -20,7 +18,6 @@ from diffusion.train_diffusion import DiffusionTrainer
 from diffusion.inference_diffusion import DiffusionSampler
 from runners.train_runner import train_one_epoch, apply_ema_to_sampler
 from runners.inference_runner import run_inference
-from util.config_loader import load_train_config, verify_config_snapshot
 
 
 # --- 윈도우 단일 GPU 환경 dist 패치 ---
@@ -55,30 +52,19 @@ def main(args):
     # TensorBoard
     os.makedirs(args.output_dir, exist_ok=True)
     log_writer = SummaryWriter(log_dir=args.output_dir) if misc.get_rank() == 0 else None
-    if log_writer is not None:
-        print(f"[*] TensorBoard log_dir: {log_writer.log_dir}")
 
     # 데이터셋
     print(f"[*] Loading dataset from: {args.data_path}")
-    dataset_train    = SingleFolderDataset(args.data_path, img_size=args.img_size, transform=build_transform(args.img_size))
+    dataset_train    = SingleFolderDataset(args.data_path, transform=build_transform(args.img_size))
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
-        sampler=torch.utils.data.SequentialSampler(dataset_train),
+        sampler=torch.utils.data.RandomSampler(dataset_train),
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=False
     )
 
-    if misc.get_rank() == 0:
-        csv_path = os.path.join(args.output_dir, 'train_log.csv')
-        # 'w' 모드로 열어 헤더를 쓰고 파일을 초기화
-        with open(csv_path, 'w', newline='') as f:
-            import csv
-            writer = csv.DictWriter(f, fieldnames=['step', 'epoch', 'loss', 'lr'])
-            writer.writeheader()
-
-    num_batches = math.ceil(len(dataset_train) / args.batch_size)
     print(f"[*] Dataset size: {len(dataset_train)} images")
     print(f"[*] Batch size: {args.batch_size}")
     print(f"[*] Number of batches per epoch: {num_batches}")
@@ -105,29 +91,9 @@ def main(args):
 
     # 체크포인트 로드
     start_epoch = 0
-    checkpoint_path = getattr(args, 'checkpoint', '')
-    if checkpoint_path:
-        if os.path.isdir(checkpoint_path):
-            raise ValueError(f"[Error] 체크포인트는 파일 경로여야 합니다. 폴더 입력 불가: {checkpoint_path}")
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"[Error] 체크포인트를 찾을 수 없습니다: {checkpoint_path}")
-        print(f"[*] Loading checkpoint: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-
-        # 체크포인트 내 args로 검증
-        if 'args' in ckpt:
-            train_args = ckpt['args']
-            from util.config_loader import MUST_MATCH_KEYS
-            mismatches = []
-            for key in MUST_MATCH_KEYS:
-                train_val = getattr(train_args, key, None)
-                curr_val  = getattr(args, key, None)
-                if train_val != curr_val:
-                    mismatches.append(f"  '{key}': 학습시={train_val!r}, 현재={curr_val!r}")
-            if mismatches:
-                raise ValueError("[Config Mismatch]\n" + "\n".join(mismatches))
-            print("[*] Config 검증 완료")
-
+    if hasattr(args, 'checkpoint') and args.checkpoint and os.path.exists(args.checkpoint):
+        print(f"[*] Loading checkpoint: {args.checkpoint}")
+        ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
         denoiser_trainer.load_state_dict(ckpt.get('model', ckpt.get('model_base')))
         if 'model_ema1' in ckpt and 'model_ema2' in ckpt:
             e1, e2 = ckpt['model_ema1'], ckpt['model_ema2']
@@ -144,9 +110,8 @@ def main(args):
     print(f"\n{'='*60}")
     print(f"[*] Training: Epoch {start_epoch} → {args.epochs}")
     print(f"    Model    : {args.model}")
-    print(f"    Img size : {args.img_size}x{args.img_size}")
-    print(f"    Class num: {args.class_num}")
-    print(f"    Device index: {device.index}")
+    print(f"    img_size : {args.img_size}x{args.img_size}")
+    print(f"    Device   : {device}")
     print(f"{'='*60}\n")
 
     start_time = time.time()
@@ -190,5 +155,4 @@ if __name__ == '__main__':
 
     args = load_train_config(cli.common_config, cli.train_config)
     os.makedirs(args.output_dir, exist_ok=True)
-
     main(args)
